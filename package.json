@@ -1,0 +1,107 @@
+{
+  "name": "predictive-fake-typing",
+  "displayName": "Predictive Fake Typing",
+  "description": "Press a hotkey, then random typing outputs predicted code from snippets file.",
+  "version": "0.0.1",
+  "publisher": "local",
+  "engines": {
+    "vscode": "^1.74.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onCommand:predictiveFakeTyping.toggle",
+    "onCommand:predictiveFakeTyping.nextSnippet",
+    "onCommand:predictiveFakeTyping.reload",
+    "onLanguage:*",
+    "onCommand:predictiveFakeTyping.pickSnippetsFile"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "predictiveFakeTyping.toggle",
+        "title": "Predictive Fake Typing: Toggle"
+      },
+      {
+        "command": "predictiveFakeTyping.nextSnippet",
+        "title": "Predictive Fake Typing: Next Snippet"
+      },
+      {
+        "command": "predictiveFakeTyping.reload",
+        "title": "Predictive Fake Typing: Reload Snippets"
+      },
+      {
+        "command": "predictiveFakeTyping.pickSnippetsFile",
+        "title": "Predictive Fake Typing: Pick Snippets File"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "predictiveFakeTyping.toggle",
+        "key": "pageup",
+        "mac": "pageup",
+        "when": "editorTextFocus"
+      },
+      {
+        "command": "predictiveFakeTyping.nextSnippet",
+        "key": "ctrl+shift+alt+n",
+        "mac": "cmd+shift+alt+n",
+        "when": "editorTextFocus"
+      },
+      {
+        "command": "predictiveFakeTyping.reload",
+        "key": "f6",
+        "mac": "f6",
+        "when": "editorTextFocus"
+      },
+      {
+        "command": "predictiveFakeTyping.pickSnippetsFile",
+        "key": "f7",
+        "mac": "f7",
+        "when": "editorTextFocus"
+      }
+    ],
+    "configuration": {
+      "title": "Predictive Fake Typing",
+      "properties": {
+        "predictiveFakeTyping.snippetsFile": {
+          "type": "string",
+          "default": "predict-snippets.txt",
+          "description": "Path to snippets file. Relative paths are resolved against workspace root."
+        },
+        "predictiveFakeTyping.blockSeparator": {
+          "type": "string",
+          "default": "\n===\n",
+          "description": "Separator used to split snippets in snippets file."
+        },
+        "predictiveFakeTyping.syncExternalChanges": {
+          "type": "boolean",
+          "default": true,
+          "description": "Sync snippet offset with external document insertions (paste/completion/accepting suggestion)."
+        },
+        "predictiveFakeTyping.triggerSuggest": {
+          "type": "boolean",
+          "default": true,
+          "description": "Auto trigger VSCode suggestion list after predictive typing inserts characters."
+        },
+        "predictiveFakeTyping.autoDisableOnSnippetEnd": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically turn off fake typing mode when current snippet reaches the end."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.10",
+    "@types/vscode": "^1.90.0",
+    "typescript": "^5.5.4"
+  }
+}
