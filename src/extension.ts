@@ -16,6 +16,7 @@ class PredictiveTypingEngine {
   private isFlushingInput = false;
   private suggestTimer: NodeJS.Timeout | undefined;
   private parameterHintsTimer: NodeJS.Timeout | undefined;
+  private pendingIndentTrim = 0;
 
   constructor(private readonly context: vscode.ExtensionContext) {}
 
@@ -28,6 +29,7 @@ class PredictiveTypingEngine {
 
     if (this.enabled) {
       this.currentOffset = 0;
+      this.pendingIndentTrim = 0;
       this.ensureValidSnippetIndex();
       if (this.snippets.length === 0) {
         vscode.window.showWarningMessage(
@@ -39,6 +41,7 @@ class PredictiveTypingEngine {
     }
 
     this.queuedInput = "";
+    this.pendingIndentTrim = 0;
     this.clearIntelliSenseTimers();
     vscode.window.setStatusBarMessage("Predictive Fake Typing: OFF", 2000);
   }
@@ -51,6 +54,7 @@ class PredictiveTypingEngine {
 
     this.currentSnippetIndex = (this.currentSnippetIndex + 1) % this.snippets.length;
     this.currentOffset = 0;
+    this.pendingIndentTrim = 0;
 
     vscode.window.setStatusBarMessage(
       `Predictive Fake Typing: switched to snippet #${this.currentSnippetIndex + 1}`,
@@ -79,6 +83,7 @@ class PredictiveTypingEngine {
 
       this.currentSnippetIndex = 0;
       this.currentOffset = 0;
+      this.pendingIndentTrim = 0;
 
       vscode.window.setStatusBarMessage(
         `Predictive Fake Typing: loaded ${this.snippets.length} snippet(s)`,
@@ -88,6 +93,7 @@ class PredictiveTypingEngine {
       this.snippets = [];
       this.currentSnippetIndex = 0;
       this.currentOffset = 0;
+      this.pendingIndentTrim = 0;
 
       const detail = error instanceof Error ? error.message : String(error);
       vscode.window.showErrorMessage(`Failed to load snippets from ${filePath}: ${detail}`);
@@ -190,11 +196,27 @@ class PredictiveTypingEngine {
         if (this.triggerSuggest && this.isSuggestionCommitCharacter(ch)) {
           await vscode.commands.executeCommand("hideSuggestWidget");
         }
+
         insertedCount += 1;
-        if (this.shouldInsertLiterally(ch)) {
-          await this.insertLiteralText(ch);
-        } else {
-          await vscode.commands.executeCommand("default:type", { text: ch });
+
+        if (this.pendingIndentTrim > 0) {
+          if (this.isHorizontalWhitespace(ch)) {
+            this.pendingIndentTrim -= 1;
+            continue;
+          }
+          this.pendingIndentTrim = 0;
+        }
+
+        if (await this.tryConsumeExistingClosingChar(ch)) {
+          if (this.triggerSuggest) {
+            this.scheduleIntelliSense(ch);
+          }
+          continue;
+        }
+
+        await vscode.commands.executeCommand("default:type", { text: ch });
+        if (ch === "\n") {
+          this.updatePendingIndentTrimAfterNewline();
         }
 
         if (this.triggerSuggest) {
@@ -203,7 +225,11 @@ class PredictiveTypingEngine {
       }
     });
 
-    // If snippet ended mid-input and mode was auto-disabled, do not swallow user keystrokes.
+    // If snippet ended and auto-disabled during this flush, drop remaining trigger keys.
+    if (!this.enabled && this.autoDisableOnSnippetEnd) {
+      return;
+    }
+
     if (insertedCount < input.length) {
       const remainingRaw = input.slice(insertedCount);
       if (remainingRaw.length > 0) {
@@ -212,32 +238,61 @@ class PredictiveTypingEngine {
     }
   }
 
-  private shouldInsertLiterally(ch: string): boolean {
-    return ch === "\n" || /[()\[\]{}"'`]/.test(ch);
+  private isHorizontalWhitespace(ch: string): boolean {
+    return ch === " " || ch === "\t";
   }
 
-  private async insertLiteralText(text: string): Promise<void> {
+  private isClosingChar(ch: string): boolean {
+    return ch === ")" || ch === "]" || ch === "}";
+  }
+
+  private async tryConsumeExistingClosingChar(ch: string): Promise<boolean> {
+    if (!this.isClosingChar(ch)) {
+      return false;
+    }
+
+    const editor = vscode.window.activeTextEditor;
+    if (!editor || editor.selections.length !== 1 || !editor.selection.isEmpty) {
+      return false;
+    }
+
+    const cursor = editor.selection.active;
+    const doc = editor.document;
+    const text = doc.getText();
+    const startOffset = doc.offsetAt(cursor);
+    const endOffset = Math.min(text.length, startOffset + 240);
+
+    for (let offset = startOffset; offset < endOffset; offset += 1) {
+      const c = text[offset] ?? "";
+      if (c === ch) {
+        const target = doc.positionAt(offset + 1);
+        editor.selection = new vscode.Selection(target, target);
+        return true;
+      }
+      if (!this.isSkippableCloserGapChar(c)) {
+        return false;
+      }
+    }
+
+    return false;
+  }
+
+  private isSkippableCloserGapChar(ch: string): boolean {
+    return ch === " " || ch === "\t" || ch === "\n" || ch === "\r";
+  }
+
+  private updatePendingIndentTrimAfterNewline(): void {
     const editor = vscode.window.activeTextEditor;
     if (!editor) {
-      await vscode.commands.executeCommand("default:type", { text });
+      this.pendingIndentTrim = 0;
       return;
     }
 
-    const ok = await editor.edit(
-      (builder) => {
-        for (const selection of editor.selections) {
-          builder.replace(selection, text);
-        }
-      },
-      {
-        undoStopBefore: false,
-        undoStopAfter: false,
-      }
-    );
-
-    if (!ok) {
-      await vscode.commands.executeCommand("default:type", { text });
-    }
+    const cursor = editor.selection.active;
+    const lineText = editor.document.lineAt(cursor.line).text;
+    const prefix = lineText.slice(0, cursor.character);
+    const match = prefix.match(/^[ \t]*/);
+    this.pendingIndentTrim = match ? match[0].length : 0;
   }
 
   public onDidChangeTextDocument(event: vscode.TextDocumentChangeEvent): void {
@@ -291,6 +346,7 @@ class PredictiveTypingEngine {
     if (this.currentOffset >= snippet.length) {
       if (this.autoDisableOnSnippetEnd) {
         this.enabled = false;
+        this.pendingIndentTrim = 0;
         this.clearIntelliSenseTimers();
         vscode.window.setStatusBarMessage(
           "Predictive Fake Typing: snippet finished, OFF",
@@ -298,6 +354,7 @@ class PredictiveTypingEngine {
         );
       } else {
         this.currentOffset = 0;
+        this.pendingIndentTrim = 0;
       }
     }
 
