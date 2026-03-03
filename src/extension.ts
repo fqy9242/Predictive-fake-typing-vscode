@@ -10,9 +10,12 @@ class PredictiveTypingEngine {
   private suppressChangeEventDepth = 0;
   private syncExternalChanges = false;
   private triggerSuggest = true;
+  private suggestDelayMs = 60;
   private autoDisableOnSnippetEnd = true;
   private queuedInput = "";
   private isFlushingInput = false;
+  private suggestTimer: NodeJS.Timeout | undefined;
+  private parameterHintsTimer: NodeJS.Timeout | undefined;
 
   constructor(private readonly context: vscode.ExtensionContext) {}
 
@@ -36,6 +39,7 @@ class PredictiveTypingEngine {
     }
 
     this.queuedInput = "";
+    this.clearIntelliSenseTimers();
     vscode.window.setStatusBarMessage("Predictive Fake Typing: OFF", 2000);
   }
 
@@ -60,6 +64,7 @@ class PredictiveTypingEngine {
     const separator = config.get<string>("blockSeparator", "\n===\n");
     this.syncExternalChanges = config.get<boolean>("syncExternalChanges", true);
     this.triggerSuggest = config.get<boolean>("triggerSuggest", true);
+    this.suggestDelayMs = Math.max(0, config.get<number>("suggestDelayMs", 60));
     this.autoDisableOnSnippetEnd = config.get<boolean>("autoDisableOnSnippetEnd", true);
 
     const filePath = this.resolvePath(filePathSetting);
@@ -174,32 +179,64 @@ class PredictiveTypingEngine {
       return;
     }
 
-    const editor = vscode.window.activeTextEditor;
-    if (!editor) {
-      return;
-    }
-
-    const predicted = this.nextPredictedChunk(input.length);
+    let insertedCount = 0;
     await this.runWithSuppressedChanges(async () => {
-      const ok = await editor.edit(
-        (builder) => {
-          for (const selection of editor.selections) {
-            builder.replace(selection, predicted);
-          }
-        },
-        {
-          undoStopBefore: false,
-          undoStopAfter: false,
+      for (let i = 0; i < input.length && this.enabled; i += 1) {
+        const ch = this.nextPredictedCharacter();
+        if (ch.length === 0) {
+          break;
         }
-      );
 
-      if (!ok) {
-        await vscode.commands.executeCommand("default:type", { text: predicted });
+        if (this.triggerSuggest && this.isSuggestionCommitCharacter(ch)) {
+          await vscode.commands.executeCommand("hideSuggestWidget");
+        }
+        insertedCount += 1;
+        if (this.shouldInsertLiterally(ch)) {
+          await this.insertLiteralText(ch);
+        } else {
+          await vscode.commands.executeCommand("default:type", { text: ch });
+        }
+
+        if (this.triggerSuggest) {
+          this.scheduleIntelliSense(ch);
+        }
       }
     });
 
-    if (this.triggerSuggest && this.shouldTriggerSuggest(predicted)) {
-      void vscode.commands.executeCommand("editor.action.triggerSuggest");
+    // If snippet ended mid-input and mode was auto-disabled, do not swallow user keystrokes.
+    if (insertedCount < input.length) {
+      const remainingRaw = input.slice(insertedCount);
+      if (remainingRaw.length > 0) {
+        await vscode.commands.executeCommand("default:type", { text: remainingRaw });
+      }
+    }
+  }
+
+  private shouldInsertLiterally(ch: string): boolean {
+    return ch === "\n" || /[()\[\]{}"'`]/.test(ch);
+  }
+
+  private async insertLiteralText(text: string): Promise<void> {
+    const editor = vscode.window.activeTextEditor;
+    if (!editor) {
+      await vscode.commands.executeCommand("default:type", { text });
+      return;
+    }
+
+    const ok = await editor.edit(
+      (builder) => {
+        for (const selection of editor.selections) {
+          builder.replace(selection, text);
+        }
+      },
+      {
+        undoStopBefore: false,
+        undoStopAfter: false,
+      }
+    );
+
+    if (!ok) {
+      await vscode.commands.executeCommand("default:type", { text });
     }
   }
 
@@ -254,7 +291,7 @@ class PredictiveTypingEngine {
     if (this.currentOffset >= snippet.length) {
       if (this.autoDisableOnSnippetEnd) {
         this.enabled = false;
-        this.queuedInput = "";
+        this.clearIntelliSenseTimers();
         vscode.window.setStatusBarMessage(
           "Predictive Fake Typing: snippet finished, OFF",
           2500
@@ -293,9 +330,9 @@ class PredictiveTypingEngine {
       const replacedLen = change.rangeLength;
       const replacedExpected = this.getSnippetBackwardSegment(replacedLen, snippet);
       if (inserted.startsWith(replacedExpected)) {
-        const newlyAdded = inserted.length - replacedLen;
-        if (newlyAdded > 0) {
-          this.advanceOffset(newlyAdded, snippet.length);
+        const addedSuffix = inserted.slice(replacedLen);
+        if (addedSuffix.length > 0 && this.matchesSnippetFromCurrentOffset(addedSuffix, snippet)) {
+          this.advanceOffset(addedSuffix.length, snippet.length);
         }
       }
     }
@@ -341,9 +378,57 @@ class PredictiveTypingEngine {
       return false;
     }
 
-    // Trigger suggestion only when it looks like an identifier path.
+    // Only trigger list completion at safe member-access boundary.
     const last = insertedText[insertedText.length - 1] ?? "";
-    return /[A-Za-z0-9_.]/.test(last);
+    return last === ".";
+  }
+
+  private isSuggestionCommitCharacter(ch: string): boolean {
+    return /[,\)\]\};\n]/.test(ch);
+  }
+
+  private scheduleIntelliSense(insertedText: string): void {
+    const shouldSuggestNow = this.shouldTriggerSuggest(insertedText);
+    const shouldTriggerParameterHints =
+      insertedText.includes("(") || insertedText.includes(",");
+
+    if (shouldSuggestNow) {
+      this.scheduleSuggest();
+    }
+    if (shouldTriggerParameterHints) {
+      this.scheduleParameterHints();
+    }
+  }
+
+  private scheduleSuggest(): void {
+    if (this.suggestTimer) {
+      clearTimeout(this.suggestTimer);
+    }
+
+    this.suggestTimer = setTimeout(() => {
+      void vscode.commands.executeCommand("editor.action.triggerSuggest");
+    }, this.suggestDelayMs);
+  }
+
+  private scheduleParameterHints(): void {
+    if (this.parameterHintsTimer) {
+      clearTimeout(this.parameterHintsTimer);
+    }
+
+    this.parameterHintsTimer = setTimeout(() => {
+      void vscode.commands.executeCommand("editor.action.triggerParameterHints");
+    }, this.suggestDelayMs + 20);
+  }
+
+  private clearIntelliSenseTimers(): void {
+    if (this.suggestTimer) {
+      clearTimeout(this.suggestTimer);
+      this.suggestTimer = undefined;
+    }
+    if (this.parameterHintsTimer) {
+      clearTimeout(this.parameterHintsTimer);
+      this.parameterHintsTimer = undefined;
+    }
   }
 
   private isSuppressingChangeEvents(): boolean {
@@ -441,3 +526,4 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 export function deactivate(): void {
   // No resources to dispose explicitly.
 }
+

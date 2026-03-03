@@ -5,7 +5,7 @@
   "version": "0.0.1",
   "publisher": "local",
   "engines": {
-    "vscode": "^1.74.0"
+    "vscode": "^1.90.0"
   },
   "categories": [
     "Other"
@@ -41,8 +41,12 @@
       {
         "command": "predictiveFakeTyping.toggle",
         "key": "pageup",
-        "mac": "pageup",
-        "when": "editorTextFocus"
+        "mac": "pageup"
+      },
+      {
+        "command": "predictiveFakeTyping.toggle",
+        "key": "pagedown",
+        "mac": "pagedown"
       },
       {
         "command": "predictiveFakeTyping.nextSnippet",
@@ -53,14 +57,22 @@
       {
         "command": "predictiveFakeTyping.reload",
         "key": "f6",
-        "mac": "f6",
-        "when": "editorTextFocus"
+        "mac": "f6"
+      },
+      {
+        "command": "predictiveFakeTyping.reload",
+        "key": "ctrl+alt+r",
+        "mac": "cmd+alt+r"
       },
       {
         "command": "predictiveFakeTyping.pickSnippetsFile",
         "key": "f7",
-        "mac": "f7",
-        "when": "editorTextFocus"
+        "mac": "f7"
+      },
+      {
+        "command": "predictiveFakeTyping.pickSnippetsFile",
+        "key": "ctrl+alt+o",
+        "mac": "cmd+alt+o"
       }
     ],
     "configuration": {
@@ -86,6 +98,12 @@
           "default": true,
           "description": "Auto trigger VSCode suggestion list after predictive typing inserts characters."
         },
+        "predictiveFakeTyping.suggestDelayMs": {
+          "type": "number",
+          "default": 60,
+          "minimum": 0,
+          "description": "Delay in milliseconds before auto-triggering completion/parameter hints after predictive insertions."
+        },
         "predictiveFakeTyping.autoDisableOnSnippetEnd": {
           "type": "boolean",
           "default": true,
@@ -103,5 +121,17 @@
     "@types/node": "^20.14.10",
     "@types/vscode": "^1.90.0",
     "typescript": "^5.5.4"
-  }
+  },
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": true
+    },
+    "virtualWorkspaces": {
+      "supported": true
+    }
+  },
+  "extensionKind": [
+    "ui",
+    "workspace"
+  ]
 }
