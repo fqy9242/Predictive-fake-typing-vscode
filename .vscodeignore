@@ -1,0 +1,12 @@
+.vscode/**
+.vscode-test/**
+.git/**
+src/**
+tsconfig.json
+package-lock.json
+.gitignore
+*.vsix
+test*.js
+template
+out/**/*.map
+.predictive-fake-typing-progress.txt

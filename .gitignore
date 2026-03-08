@@ -4,3 +4,5 @@ out/
 *.vsix
 .vscode
 test*.js
+predict-snippets.txt
+.predictive-fake-typing-progress.txt

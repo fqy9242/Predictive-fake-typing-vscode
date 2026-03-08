@@ -1,12 +1,24 @@
-import * as vscode from "vscode";
+﻿import * as vscode from "vscode";
 import * as fs from "fs";
 import * as path from "path";
 
+type ReloadSnippetsOptions = {
+  preserveCurrentIndex?: boolean;
+  showStatus?: boolean;
+};
+
+type ParsedSnippets = {
+  snippets: string[];
+  snippetStartLines: number[];
+  totalLines: number;
+};
 class PredictiveTypingEngine {
   private enabled = false;
   private snippets: string[] = [];
   private currentSnippetIndex = 0;
   private currentOffset = 0;
+  private snippetStartLines: number[] = [];
+  private totalSnippetFileLines = 0;
   private suppressChangeEventDepth = 0;
   private syncExternalChanges = false;
   private triggerSuggest = true;
@@ -17,52 +29,74 @@ class PredictiveTypingEngine {
   private suggestTimer: NodeJS.Timeout | undefined;
   private parameterHintsTimer: NodeJS.Timeout | undefined;
   private pendingIndentTrim = 0;
+  private pendingExistingClosingTagRemainder = "";
+  private progressFileSetting = "";
+  private progressWriteQueue: Promise<void> = Promise.resolve();
 
   constructor(private readonly context: vscode.ExtensionContext) {}
 
   public async init(): Promise<void> {
     await this.reloadSnippets();
+    this.updateEnabledContext();
   }
 
-  public toggle(): void {
-    this.enabled = !this.enabled;
-
+  public async toggle(): Promise<void> {
     if (this.enabled) {
-      this.currentOffset = 0;
-      this.pendingIndentTrim = 0;
-      this.ensureValidSnippetIndex();
-      if (this.snippets.length === 0) {
-        vscode.window.showWarningMessage(
-          "Predictive Fake Typing: no snippets loaded. Run 'Predictive Fake Typing: Reload Snippets' or check predictiveFakeTyping.snippetsFile."
-        );
-      }
-      vscode.window.setStatusBarMessage("Predictive Fake Typing: ON", 2000);
+      this.disableMode("Predictive Fake Typing: OFF");
       return;
     }
 
-    this.queuedInput = "";
-    this.pendingIndentTrim = 0;
-    this.clearIntelliSenseTimers();
-    vscode.window.setStatusBarMessage("Predictive Fake Typing: OFF", 2000);
+    await this.reloadSnippets({ preserveCurrentIndex: true, showStatus: false });
+    this.startCurrentSnippet(this.buildSnippetStatusMessage("Predictive Fake Typing: ON"));
   }
 
-  public nextSnippet(): void {
-    if (this.snippets.length === 0) {
-      vscode.window.showWarningMessage("No snippets loaded.");
+  public exit(): void {
+    if (!this.enabled) {
+      return;
+    }
+
+    this.disableMode("Predictive Fake Typing: OFF");
+  }
+
+  public async nextSnippet(): Promise<void> {
+    await this.reloadSnippets({ preserveCurrentIndex: true, showStatus: false });
+    if (!this.ensureSnippetNavigationAvailable()) {
       return;
     }
 
     this.currentSnippetIndex = (this.currentSnippetIndex + 1) % this.snippets.length;
-    this.currentOffset = 0;
-    this.pendingIndentTrim = 0;
-
-    vscode.window.setStatusBarMessage(
-      `Predictive Fake Typing: switched to snippet #${this.currentSnippetIndex + 1}`,
-      2000
-    );
+    this.startCurrentSnippet(this.buildSnippetStatusMessage("Predictive Fake Typing: snippet"));
   }
 
-  public async reloadSnippets(): Promise<void> {
+  public async previousSnippet(): Promise<void> {
+    await this.reloadSnippets({ preserveCurrentIndex: true, showStatus: false });
+    if (!this.ensureSnippetNavigationAvailable()) {
+      return;
+    }
+
+    this.currentSnippetIndex =
+      (this.currentSnippetIndex - 1 + this.snippets.length) % this.snippets.length;
+    this.startCurrentSnippet(this.buildSnippetStatusMessage("Predictive Fake Typing: snippet"));
+  }
+
+  private ensureSnippetNavigationAvailable(): boolean {
+    if (this.snippets.length === 0) {
+      vscode.window.showWarningMessage("Predictive Fake Typing: no snippets loaded.");
+      return false;
+    }
+
+    if (this.snippets.length === 1) {
+      vscode.window.showWarningMessage(
+        "Predictive Fake Typing: only 1 snippet is loaded. Run 'Pick Snippets File' and then 'Reload Snippets' if you expected multiple sections."
+      );
+      return false;
+    }
+
+    return true;
+  }
+
+  public async reloadSnippets(options: ReloadSnippetsOptions = {}): Promise<void> {
+    const { preserveCurrentIndex = false, showStatus = true } = options;
     const config = vscode.workspace.getConfiguration("predictiveFakeTyping");
     const filePathSetting = config.get<string>("snippetsFile", "predict-snippets.txt");
     const separator = config.get<string>("blockSeparator", "\n===\n");
@@ -70,30 +104,47 @@ class PredictiveTypingEngine {
     this.triggerSuggest = config.get<boolean>("triggerSuggest", true);
     this.suggestDelayMs = Math.max(0, config.get<number>("suggestDelayMs", 60));
     this.autoDisableOnSnippetEnd = config.get<boolean>("autoDisableOnSnippetEnd", true);
+    this.progressFileSetting = config.get<string>("progressFile", "");
 
     const filePath = this.resolvePath(filePathSetting);
 
     try {
       const raw = await fs.promises.readFile(filePath, "utf8");
       const content = raw.replace(/\r\n/g, "\n");
-      this.snippets = content
-        .split(separator)
-        .map((s) => s.trim())
-        .filter((s) => s.length > 0);
+      const previousSnippetIndex = this.currentSnippetIndex;
+      const parsed = this.parseSnippets(content, separator);
+      this.snippets = parsed.snippets;
+      this.snippetStartLines = parsed.snippetStartLines;
+      this.totalSnippetFileLines = parsed.totalLines;
 
-      this.currentSnippetIndex = 0;
+      if (this.snippets.length === 0) {
+        this.currentSnippetIndex = 0;
+      } else if (preserveCurrentIndex) {
+        this.currentSnippetIndex = Math.min(previousSnippetIndex, this.snippets.length - 1);
+      } else {
+        this.currentSnippetIndex = 0;
+      }
+
       this.currentOffset = 0;
       this.pendingIndentTrim = 0;
+      this.pendingExistingClosingTagRemainder = "";
+      this.writeProgressMarker();
 
-      vscode.window.setStatusBarMessage(
-        `Predictive Fake Typing: loaded ${this.snippets.length} snippet(s)`,
-        2500
-      );
+      if (showStatus) {
+        vscode.window.setStatusBarMessage(
+          `Predictive Fake Typing: loaded ${this.snippets.length} snippet(s)`,
+          2500
+        );
+      }
     } catch (error) {
       this.snippets = [];
+      this.snippetStartLines = [];
+      this.totalSnippetFileLines = 0;
       this.currentSnippetIndex = 0;
       this.currentOffset = 0;
       this.pendingIndentTrim = 0;
+      this.pendingExistingClosingTagRemainder = "";
+      this.writeProgressMarker();
 
       const detail = error instanceof Error ? error.message : String(error);
       vscode.window.showErrorMessage(`Failed to load snippets from ${filePath}: ${detail}`);
@@ -153,6 +204,189 @@ class PredictiveTypingEngine {
     );
   }
 
+  public async pickProgressFile(): Promise<void> {
+    const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
+    const selected = await vscode.window.showSaveDialog({
+      title: "Select Predictive Progress File",
+      saveLabel: "Use for progress output",
+      defaultUri: workspaceFolder?.uri,
+      filters: {
+        "Text files": ["txt"],
+        "All files": ["*"],
+      },
+    });
+
+    if (!selected) {
+      return;
+    }
+
+    const pickedPath = selected.fsPath;
+    const target = workspaceFolder
+      ? vscode.ConfigurationTarget.Workspace
+      : vscode.ConfigurationTarget.Global;
+
+    let configPath = pickedPath;
+    if (workspaceFolder) {
+      const rel = path.relative(workspaceFolder.uri.fsPath, pickedPath);
+      if (rel.length > 0 && !rel.startsWith("..") && !path.isAbsolute(rel)) {
+        configPath = rel.replace(/\\/g, "/");
+      }
+    }
+
+    const config = vscode.workspace.getConfiguration("predictiveFakeTyping");
+    await config.update("progressFile", configPath, target);
+    this.progressFileSetting = configPath;
+    this.writeProgressMarker();
+    vscode.window.setStatusBarMessage(
+      `Predictive Fake Typing: progress file -> ${configPath}`,
+      3000
+    );
+  }
+
+  private startCurrentSnippet(statusMessage: string): void {
+    this.ensureValidSnippetIndex();
+
+    if (this.snippets.length === 0) {
+      this.enabled = false;
+      this.currentOffset = 0;
+      this.pendingIndentTrim = 0;
+      this.pendingExistingClosingTagRemainder = "";
+      this.queuedInput = "";
+      this.clearIntelliSenseTimers();
+      this.updateEnabledContext();
+      this.writeProgressMarker();
+      vscode.window.showWarningMessage(
+        "Predictive Fake Typing: no snippets loaded. Run 'Predictive Fake Typing: Reload Snippets' or check predictiveFakeTyping.snippetsFile."
+      );
+      return;
+    }
+
+    this.enabled = true;
+    this.currentOffset = 0;
+    this.pendingIndentTrim = 0;
+    this.pendingExistingClosingTagRemainder = "";
+    this.queuedInput = "";
+    this.clearIntelliSenseTimers();
+    this.updateEnabledContext();
+    this.writeProgressMarker();
+    vscode.window.setStatusBarMessage(statusMessage, 2000);
+  }
+
+  private disableMode(statusMessage: string): void {
+    this.enabled = false;
+    this.queuedInput = "";
+    this.pendingIndentTrim = 0;
+    this.pendingExistingClosingTagRemainder = "";
+    this.clearIntelliSenseTimers();
+    this.updateEnabledContext();
+    this.writeProgressMarker();
+    vscode.window.setStatusBarMessage(statusMessage, 2000);
+  }
+
+  private buildSnippetStatusMessage(prefix: string): string {
+    if (this.snippets.length <= 1) {
+      return prefix;
+    }
+
+    return `${prefix} ${this.currentSnippetIndex + 1}/${this.snippets.length}`;
+  }
+
+  private parseSnippets(content: string, separatorSetting: string): ParsedSnippets {
+    const separator = this.normalizeSeparator(separatorSetting);
+    const totalLines = content.length === 0 ? 0 : content.split("\n").length;
+
+    if (separator.trim() === "===") {
+      return this.parseLineSeparatedSnippets(content, totalLines);
+    }
+
+    return this.parseStringSeparatedSnippets(content, separator, totalLines);
+  }
+
+  private parseLineSeparatedSnippets(content: string, totalLines: number): ParsedSnippets {
+    const snippets: string[] = [];
+    const snippetStartLines: number[] = [];
+    const lines = content.split("\n");
+    let blockLines: string[] = [];
+    let blockStartLine = 1;
+
+    const flushBlock = (): void => {
+      const rawBlock = blockLines.join("\n");
+      this.pushParsedSnippet(snippets, snippetStartLines, rawBlock, blockStartLine);
+      blockLines = [];
+    };
+
+    for (let i = 0; i < lines.length; i += 1) {
+      const line = lines[i] ?? "";
+      if (/^[ \t]*===[ \t]*$/.test(line)) {
+        flushBlock();
+        blockStartLine = i + 2;
+        continue;
+      }
+
+      blockLines.push(line);
+    }
+
+    flushBlock();
+    return { snippets, snippetStartLines, totalLines };
+  }
+
+  private parseStringSeparatedSnippets(
+    content: string,
+    separator: string,
+    totalLines: number
+  ): ParsedSnippets {
+    const snippets: string[] = [];
+    const snippetStartLines: number[] = [];
+    let cursor = 0;
+    let blockStartLine = 1;
+
+    while (cursor <= content.length) {
+      const nextIndex = content.indexOf(separator, cursor);
+      const blockEnd = nextIndex === -1 ? content.length : nextIndex;
+      const rawBlock = content.slice(cursor, blockEnd);
+      this.pushParsedSnippet(snippets, snippetStartLines, rawBlock, blockStartLine);
+
+      if (nextIndex === -1) {
+        break;
+      }
+
+      const consumed = content.slice(cursor, nextIndex + separator.length);
+      blockStartLine += this.countNewlines(consumed);
+      cursor = nextIndex + separator.length;
+    }
+
+    return { snippets, snippetStartLines, totalLines };
+  }
+
+  private pushParsedSnippet(
+    snippets: string[],
+    snippetStartLines: number[],
+    rawBlock: string,
+    rawStartLine: number
+  ): void {
+    const trimmed = rawBlock.trim();
+    if (trimmed.length === 0) {
+      return;
+    }
+
+    const leadingWhitespace = rawBlock.match(/^\s*/)?.[0] ?? "";
+    const leadingNewlines = this.countNewlines(leadingWhitespace);
+    snippets.push(trimmed);
+    snippetStartLines.push(rawStartLine + leadingNewlines);
+  }
+
+  private countNewlines(text: string): number {
+    return (text.match(/\n/g) ?? []).length;
+  }
+
+  private normalizeSeparator(separator: string): string {
+    return separator.replace(/\\r\\n/g, "\n").replace(/\\n/g, "\n").replace(/\r\n/g, "\n");
+  }
+
+  private updateEnabledContext(): void {
+    void vscode.commands.executeCommand("setContext", "predictiveFakeTyping.enabled", this.enabled);
+  }
+
   private async flushQueuedInput(): Promise<void> {
     if (this.isFlushingInput) {
       return;
@@ -202,15 +436,17 @@ class PredictiveTypingEngine {
         if (this.pendingIndentTrim > 0) {
           if (this.isHorizontalWhitespace(ch)) {
             this.pendingIndentTrim -= 1;
+            this.writeProgressMarker();
             continue;
           }
           this.pendingIndentTrim = 0;
         }
 
-        if (await this.tryConsumeExistingClosingChar(ch)) {
+        if (await this.tryConsumeExistingAutoInsertedChar(ch)) {
           if (this.triggerSuggest) {
             this.scheduleIntelliSense(ch);
           }
+          this.writeProgressMarker();
           continue;
         }
 
@@ -222,10 +458,10 @@ class PredictiveTypingEngine {
         if (this.triggerSuggest) {
           this.scheduleIntelliSense(ch);
         }
+        this.writeProgressMarker();
       }
     });
 
-    // If snippet ended and auto-disabled during this flush, drop remaining trigger keys.
     if (!this.enabled && this.autoDisableOnSnippetEnd) {
       return;
     }
@@ -244,6 +480,123 @@ class PredictiveTypingEngine {
 
   private isClosingChar(ch: string): boolean {
     return ch === ")" || ch === "]" || ch === "}";
+  }
+
+  private isQuoteChar(ch: string): boolean {
+    return ch === `"` || ch === "'" || ch === "`";
+  }
+
+  private async tryConsumeExistingAutoInsertedChar(ch: string): Promise<boolean> {
+    if (await this.tryConsumePendingExistingClosingTagChar(ch)) {
+      return true;
+    }
+
+    if (await this.tryStartConsumingExistingClosingTag(ch)) {
+      return true;
+    }
+
+    if (await this.tryConsumeExistingQuote(ch)) {
+      return true;
+    }
+
+    return this.tryConsumeExistingClosingChar(ch);
+  }
+
+  private async tryConsumePendingExistingClosingTagChar(ch: string): Promise<boolean> {
+    if (this.pendingExistingClosingTagRemainder.length === 0) {
+      return false;
+    }
+
+    if (ch !== this.pendingExistingClosingTagRemainder[0]) {
+      this.pendingExistingClosingTagRemainder = "";
+      return false;
+    }
+
+    const editor = vscode.window.activeTextEditor;
+    if (!editor || editor.selections.length !== 1 || !editor.selection.isEmpty) {
+      this.pendingExistingClosingTagRemainder = "";
+      return false;
+    }
+
+    const cursor = editor.selection.active;
+    const doc = editor.document;
+    const offset = doc.offsetAt(cursor);
+    if ((doc.getText().charAt(offset) ?? "") !== ch) {
+      this.pendingExistingClosingTagRemainder = "";
+      return false;
+    }
+
+    const target = doc.positionAt(offset + 1);
+    editor.selection = new vscode.Selection(target, target);
+    this.pendingExistingClosingTagRemainder = this.pendingExistingClosingTagRemainder.slice(1);
+    return true;
+  }
+
+  private async tryStartConsumingExistingClosingTag(ch: string): Promise<boolean> {
+    if (ch !== "<") {
+      return false;
+    }
+
+    const segment = this.getCurrentClosingTagSegment();
+    if (segment.length === 0) {
+      return false;
+    }
+
+    const editor = vscode.window.activeTextEditor;
+    if (!editor || editor.selections.length !== 1 || !editor.selection.isEmpty) {
+      return false;
+    }
+
+    const cursor = editor.selection.active;
+    const doc = editor.document;
+    const text = doc.getText();
+    const startOffset = doc.offsetAt(cursor);
+    const endOffset = Math.min(text.length, startOffset + segment.length + 64);
+    const visibleText = text.slice(startOffset, endOffset);
+    const gapMatch = visibleText.match(/^[ \t\r\n]*/);
+    const gapLength = gapMatch ? gapMatch[0].length : 0;
+
+    if (visibleText.slice(gapLength, gapLength + segment.length) !== segment) {
+      return false;
+    }
+
+    const target = doc.positionAt(startOffset + gapLength + 1);
+    editor.selection = new vscode.Selection(target, target);
+    this.pendingExistingClosingTagRemainder = segment.slice(1);
+    return true;
+  }
+
+  private getCurrentClosingTagSegment(): string {
+    const snippet = this.getCurrentSnippet();
+    if (snippet.length === 0) {
+      return "";
+    }
+
+    const start = Math.max(0, this.currentOffset - 1);
+    const match = snippet.slice(start).match(/^<\/[A-Za-z0-9:_-]+\s*>/);
+    return match ? match[0] : "";
+  }
+
+  private async tryConsumeExistingQuote(ch: string): Promise<boolean> {
+    if (!this.isQuoteChar(ch)) {
+      return false;
+    }
+
+    const editor = vscode.window.activeTextEditor;
+    if (!editor || editor.selections.length !== 1 || !editor.selection.isEmpty) {
+      return false;
+    }
+
+    const cursor = editor.selection.active;
+    const doc = editor.document;
+    const offset = doc.offsetAt(cursor);
+    if ((doc.getText().charAt(offset) ?? "") !== ch) {
+      return false;
+    }
+
+    const target = doc.positionAt(offset + 1);
+    editor.selection = new vscode.Selection(target, target);
+    return true;
   }
 
   private async tryConsumeExistingClosingChar(ch: string): Promise<boolean> {
@@ -295,6 +648,63 @@ class PredictiveTypingEngine {
     this.pendingIndentTrim = match ? match[0].length : 0;
   }
 
+  private writeProgressMarker(): void {
+    const progressPath = this.resolveProgressFilePath();
+    if (!progressPath) {
+      return;
+    }
+
+    const marker = this.buildProgressMarker();
+    this.progressWriteQueue = this.progressWriteQueue
+      .then(async () => {
+        await fs.promises.mkdir(path.dirname(progressPath), { recursive: true });
+        await fs.promises.writeFile(progressPath, marker, "utf8");
+      })
+      .catch((error) => {
+        console.error("Predictive Fake Typing: failed to write progress marker", error);
+      });
+  }
+
+  private buildProgressMarker(): string {
+    const totalLines = this.totalSnippetFileLines;
+    const snippet = this.getCurrentSnippet();
+    if (snippet.length === 0) {
+      return `0,${totalLines}`;
+    }
+
+    const safeOffset = Math.max(0, Math.min(this.currentOffset, snippet.length));
+    let currentLine = this.getCurrentSnippetStartLine();
+    for (let i = 0; i < safeOffset; i += 1) {
+      if (snippet[i] === "\n") {
+        currentLine += 1;
+      }
+    }
+
+    return `${currentLine},${totalLines}`;
+  }
+
+  private getCurrentSnippetStartLine(): number {
+    if (this.currentSnippetIndex < 0 || this.currentSnippetIndex >= this.snippetStartLines.length) {
+      return 0;
+    }
+
+    return this.snippetStartLines[this.currentSnippetIndex] ?? 0;
+  }
+
+  private resolveProgressFilePath(): string | undefined {
+    const configPath = this.progressFileSetting.trim();
+    if (configPath.length > 0) {
+      return this.resolvePath(configPath);
+    }
+
+    const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
+    if (workspaceFolder) {
+      return path.join(workspaceFolder.uri.fsPath, ".predictive-fake-typing-progress.txt");
+    }
+
+    return path.join(this.context.globalStorageUri.fsPath, "predictive-fake-typing-progress.txt");
+  }
+
   public onDidChangeTextDocument(event: vscode.TextDocumentChangeEvent): void {
     if (!this.enabled || this.isSuppressingChangeEvents() || !this.syncExternalChanges) {
       return;
@@ -321,17 +731,6 @@ class PredictiveTypingEngine {
     }
   }
 
-  private nextPredictedChunk(length: number): string {
-    let output = "";
-    for (let i = 0; i < length; i += 1) {
-      if (!this.enabled) {
-        break;
-      }
-      output += this.nextPredictedCharacter();
-    }
-    return output;
-  }
-
   private nextPredictedCharacter(): string {
     this.ensureValidSnippetIndex();
 
@@ -346,8 +745,12 @@ class PredictiveTypingEngine {
     if (this.currentOffset >= snippet.length) {
       if (this.autoDisableOnSnippetEnd) {
         this.enabled = false;
+        this.queuedInput = "";
         this.pendingIndentTrim = 0;
+        this.pendingExistingClosingTagRemainder = "";
         this.clearIntelliSenseTimers();
+        this.updateEnabledContext();
+        this.writeProgressMarker();
         vscode.window.setStatusBarMessage(
           "Predictive Fake Typing: snippet finished, OFF",
           2500
@@ -355,6 +758,8 @@ class PredictiveTypingEngine {
       } else {
         this.currentOffset = 0;
         this.pendingIndentTrim = 0;
+        this.pendingExistingClosingTagRemainder = "";
+        this.writeProgressMarker();
       }
     }
 
@@ -374,15 +779,12 @@ class PredictiveTypingEngine {
       return;
     }
 
-    // Only align when external insertion exactly matches the expected stream.
-    // Fuzzy jumps can skip characters and cause visible "missing letters".
     if (this.matchesSnippetFromCurrentOffset(inserted, snippet)) {
       this.advanceOffset(inserted.length, snippet.length);
+      this.writeProgressMarker();
       return;
     }
 
-    // Handle completion-accept case where VSCode replaces an existing prefix
-    // with a longer completed token (e.g. "pri" -> "print").
     if (change.rangeLength > 0) {
       const replacedLen = change.rangeLength;
       const replacedExpected = this.getSnippetBackwardSegment(replacedLen, snippet);
@@ -390,6 +792,7 @@ class PredictiveTypingEngine {
         const addedSuffix = inserted.slice(replacedLen);
         if (addedSuffix.length > 0 && this.matchesSnippetFromCurrentOffset(addedSuffix, snippet)) {
           this.advanceOffset(addedSuffix.length, snippet.length);
+          this.writeProgressMarker();
         }
       }
     }
@@ -435,7 +838,6 @@ class PredictiveTypingEngine {
       return false;
     }
 
-    // Only trigger list completion at safe member-access boundary.
     const last = insertedText[insertedText.length - 1] ?? "";
     return last === ".";
   }
@@ -544,14 +946,26 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   await engine.init();
 
   context.subscriptions.push(
-    vscode.commands.registerCommand("predictiveFakeTyping.toggle", () => {
-      engine.toggle();
+    vscode.commands.registerCommand("predictiveFakeTyping.toggle", async () => {
+      await engine.toggle();
     })
   );
 
   context.subscriptions.push(
-    vscode.commands.registerCommand("predictiveFakeTyping.nextSnippet", () => {
-      engine.nextSnippet();
+    vscode.commands.registerCommand("predictiveFakeTyping.exit", () => {
+      engine.exit();
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand("predictiveFakeTyping.nextSnippet", async () => {
+      await engine.nextSnippet();
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand("predictiveFakeTyping.previousSnippet", async () => {
+      await engine.previousSnippet();
     })
   );
 
@@ -564,6 +978,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   context.subscriptions.push(
     vscode.commands.registerCommand("predictiveFakeTyping.pickSnippetsFile", async () => {
       await engine.pickSnippetsFile();
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand("predictiveFakeTyping.pickProgressFile", async () => {
+      await engine.pickProgressFile();
     })
   );
 
@@ -583,4 +1003,3 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 export function deactivate(): void {
   // No resources to dispose explicitly.
 }
-

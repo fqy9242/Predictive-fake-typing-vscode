@@ -12,10 +12,13 @@
   ],
   "activationEvents": [
     "onCommand:predictiveFakeTyping.toggle",
+    "onCommand:predictiveFakeTyping.exit",
     "onCommand:predictiveFakeTyping.nextSnippet",
+    "onCommand:predictiveFakeTyping.previousSnippet",
     "onCommand:predictiveFakeTyping.reload",
-    "onLanguage:*",
-    "onCommand:predictiveFakeTyping.pickSnippetsFile"
+    "onCommand:predictiveFakeTyping.pickSnippetsFile",
+    "onCommand:predictiveFakeTyping.pickProgressFile",
+    "onLanguage:*"
   ],
   "main": "./out/extension.js",
   "contributes": {
@@ -25,8 +28,16 @@
         "title": "Predictive Fake Typing: Toggle"
       },
       {
+        "command": "predictiveFakeTyping.exit",
+        "title": "Predictive Fake Typing: Exit"
+      },
+      {
         "command": "predictiveFakeTyping.nextSnippet",
         "title": "Predictive Fake Typing: Next Snippet"
+      },
+      {
+        "command": "predictiveFakeTyping.previousSnippet",
+        "title": "Predictive Fake Typing: Previous Snippet"
       },
       {
         "command": "predictiveFakeTyping.reload",
@@ -35,23 +46,35 @@
       {
         "command": "predictiveFakeTyping.pickSnippetsFile",
         "title": "Predictive Fake Typing: Pick Snippets File"
+      },
+      {
+        "command": "predictiveFakeTyping.pickProgressFile",
+        "title": "Predictive Fake Typing: Pick Progress File"
       }
     ],
     "keybindings": [
       {
-        "command": "predictiveFakeTyping.toggle",
+        "command": "predictiveFakeTyping.previousSnippet",
         "key": "pageup",
-        "mac": "pageup"
-      },
-      {
-        "command": "predictiveFakeTyping.toggle",
-        "key": "pagedown",
-        "mac": "pagedown"
+        "mac": "pageup",
+        "when": "editorTextFocus"
       },
       {
         "command": "predictiveFakeTyping.nextSnippet",
-        "key": "ctrl+shift+alt+n",
-        "mac": "cmd+shift+alt+n",
+        "key": "pagedown",
+        "mac": "pagedown",
+        "when": "editorTextFocus"
+      },
+      {
+        "command": "predictiveFakeTyping.exit",
+        "key": "escape",
+        "mac": "escape",
+        "when": "editorTextFocus && predictiveFakeTyping.enabled && !suggestWidgetVisible"
+      },
+      {
+        "command": "predictiveFakeTyping.toggle",
+        "key": "ctrl+shift+alt+t",
+        "mac": "cmd+shift+alt+t",
         "when": "editorTextFocus"
       },
       {
@@ -73,6 +96,16 @@
         "command": "predictiveFakeTyping.pickSnippetsFile",
         "key": "ctrl+alt+o",
         "mac": "cmd+alt+o"
+      },
+      {
+        "command": "predictiveFakeTyping.pickProgressFile",
+        "key": "f8",
+        "mac": "f8"
+      },
+      {
+        "command": "predictiveFakeTyping.pickProgressFile",
+        "key": "ctrl+alt+p",
+        "mac": "cmd+alt+p"
       }
     ],
     "configuration": {
@@ -108,6 +141,11 @@
           "type": "boolean",
           "default": true,
           "description": "Automatically turn off fake typing mode when current snippet reaches the end."
+        },
+        "predictiveFakeTyping.progressFile": {
+          "type": "string",
+          "default": "",
+          "description": "Progress output file path. When set, writes currentLine,totalLines on each predictive step."
         }
       }
     }
